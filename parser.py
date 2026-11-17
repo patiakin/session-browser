@@ -35,7 +35,7 @@ LITE_READ_BUF_SIZE = 65536
 
 def stream_jsonl(path: str):
     """Yield parsed records one at a time without loading the full file."""
-    with open(path) as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -159,88 +159,103 @@ _CMD_PATH_PATTERNS = [
 _git_root_cache: dict[str, str | None] = {}
 
 
+
 def _find_git_root(path: str) -> str | None:
-    """Walk up from path to find the nearest .git directory.
-    Returns the repo root directory, or None if not in a git repo.
-    Uses a cache to avoid repeated filesystem walks."""
-    expanded = os.path.expanduser(path)
+    """Find the nearest Git repository root, with cross-platform caching."""
 
-    # If it's a file, start from its parent
-    if not os.path.isdir(expanded):
-        expanded = os.path.dirname(expanded)
+    expanded = os.path.abspath(os.path.expanduser(path))
+    current = Path(expanded)
 
-    # Check cache for this path or any parent
-    check = expanded
-    while check and check != "/":
-        if check in _git_root_cache:
-            return _git_root_cache[check]
-        check = os.path.dirname(check)
+    # If it's a file or a non-existing path, start from its parent.
+    if not current.is_dir():
+        current = current.parent
 
-    # Walk up looking for .git (stop before home dir — dotfiles repos aren't projects)
-    home = os.path.expanduser("~")
-    current = expanded
-    while current and current != "/" and current != home:
-        if os.path.isdir(os.path.join(current, ".git")):
-            # Cache this and all intermediate paths
-            cache_path = expanded
-            while cache_path != current and cache_path != "/":
-                _git_root_cache[cache_path] = current
-                cache_path = os.path.dirname(cache_path)
-            _git_root_cache[current] = current
-            return current
-        current = os.path.dirname(current)
+    home = Path(os.path.abspath(os.path.expanduser("~")))
+    visited = []
 
-    # No git root found — cache the miss
-    _git_root_cache[expanded] = None
+    while True:
+        key = os.path.normcase(str(current))
+
+        # Check cache.
+        if key in _git_root_cache:
+            result = _git_root_cache[key]
+
+            for p in visited:
+                _git_root_cache[os.path.normcase(str(p))] = result
+
+            return result
+
+        # Don't search above the user's home directory.
+        if current == home:
+            break
+
+        visited.append(current)
+
+        # .git can be either a directory or a file (worktrees).
+        if (current / ".git").exists():
+            root = str(current)
+
+            for p in visited:
+                _git_root_cache[os.path.normcase(str(p))] = root
+
+            return root
+
+        # Stop at filesystem root (C:\, D:\, /, etc.).
+        parent = current.parent
+        if parent == current:
+            break
+
+        current = parent
+
+    # Cache negative result for all visited directories.
+    for p in visited:
+        _git_root_cache[os.path.normcase(str(p))] = None
+
     return None
 
 
-def _path_to_repo(path: str) -> str | None:
-    """Map a file/directory path to a repo name.
 
-    First tries to find a git root on disk (fast, cached). If the path
-    no longer exists (e.g., deleted worktree from a past session), falls
-    back to heuristic extraction from the path structure.
-    """
+def _path_to_repo(path: str) -> str | None:
+    """Map a file/directory path to a repo name."""
+
     if not path:
         return None
 
     expanded = os.path.expanduser(path)
+    path_obj = Path(expanded)
 
     # Skip paths inside ~/.claude — label as "claude-config"
-    if "/.claude/" in expanded:
+    if ".claude" in [p.lower() for p in path_obj.parts]:
         return "claude-config"
 
-    # Try filesystem-based git root detection first
+    # Try filesystem-based Git root detection.
     git_root = _find_git_root(expanded)
     if git_root:
-        return os.path.basename(git_root)
+        return Path(git_root).name
 
-    # Path doesn't exist on disk — extract repo name heuristically.
-    # Only match paths under common development directories.
-    home = os.path.expanduser("~")
-    if not expanded.startswith(home):
+    # Path doesn't exist on disk: use heuristic extraction.
+    home = Path(os.path.expanduser("~"))
+
+    try:
+        rel = path_obj.relative_to(home)
+    except ValueError:
         return None
 
-    rel = expanded[len(home):].strip("/")
-    parts = rel.split("/")
+    parts = rel.parts
+
     if len(parts) < 2:
         return None
 
     # Only consider paths under known dev-like top-level dirs
     dev_roots = {"dev", "projects", "repos", "src", "code", "workspace", "go"}
-    if parts[0] not in dev_roots:
+
+    if parts[0].lower() not in dev_roots:
         return None
 
-    # ~/dev/<repo>/... -> repo  OR  ~/dev/<org>/<repo>/... -> repo
-    # Take the deepest directory that's at most 3 levels under home
-    # and has siblings (i.e., it's not a leaf file)
     if len(parts) >= 3:
-        return parts[2]  # ~/dev/org/repo
-    if len(parts) >= 2:
-        return parts[1]  # ~/dev/repo
+        return parts[2]
 
-    return None
+    return parts[1]
 
 
 def _collect_repos(file_paths: set[str], bash_commands: list[str]) -> list[str]:
